@@ -1,0 +1,22 @@
+# MonolithPy install (large; built externally and dropped here)
+/monolithpy*/
+
+# Packer output
+/dist/
+
+# Throwaway test workspaces
+/test_isolation/
+/test_clean/
+/src/workspace/
+
+# Build artifacts
+*.obj
+*.o
+*.lib
+*.a
+*.exe
+*.pdb
+*.exp
+*.ilk
+__pycache__/
+*.pyc

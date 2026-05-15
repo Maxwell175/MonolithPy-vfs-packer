@@ -1,0 +1,109 @@
+name: pack-stdlib
+
+# Smoke-test the packer against a stock MonolithPy 3.14 install (stdlib
+# only - no extra pip packages) on Windows and macOS. Pulls the most
+# recent matching artifact from Nuitka/MonolithPy's 3.14 branch and runs
+# pack_embed end-to-end, then builds and runs the sample exe.
+#
+# Linux is intentionally skipped for now: the upstream artifact is 7+ GB
+# (much larger than Windows/macOS) and a few packer paths haven't been
+# exercised against it yet.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly Monday 06:00 UTC, to catch breakage from upstream MonolithPy
+    # changes even when this repo isn't touched.
+    - cron: '0 6 * * 1'
+
+jobs:
+  pack-stdlib:
+    name: pack-stdlib (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            artifact: MonolithPy314_windows_x64
+          - os: macos-26
+            # macos-26 runners are arm64. mac_x86_64 also exists upstream
+            # if x86_64 coverage is wanted later.
+            artifact: MonolithPy314_mac_arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Get MonolithPy artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          repo: Nuitka/MonolithPy
+          workflow: main.yml
+          workflow_conclusion: success
+          branch: 3.14
+          name: ${{ matrix.artifact }}
+          path: monolithpy314
+
+      - name: Restore POSIX executable bits
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # actions/upload-artifact strips the executable bit. Re-set it
+          # on python and any compiled tooling shipped in the install.
+          find monolithpy314 -type f \( -name 'python' -o -name 'python3' \
+              -o -name 'python3.*' \) -exec chmod +x {} \;
+
+      - name: Pack stdlib-only bundle
+        run: python pack_embed.py --keep-build
+
+      - name: Set up MSVC for sample build
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build sample exe
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+              cmake -S dist/embed_bundle/samples -B sample_build \
+                  -G "Visual Studio 17 2022" -A x64
+          else
+              cmake -S dist/embed_bundle/samples -B sample_build \
+                  -DCMAKE_BUILD_TYPE=Release
+          fi
+          cmake --build sample_build --config Release
+
+      - name: Smoke-test sample exe
+        shell: bash
+        run: |
+          exe=$(find sample_build -type f \
+              \( -name 'embed_sample' -o -name 'embed_sample.exe' \) \
+              | head -1)
+          if [ -z "$exe" ]; then
+              echo "embed_sample binary not found under sample_build/"
+              find sample_build -maxdepth 4 -type f
+              exit 1
+          fi
+          ls -la "$exe"
+          # Hit a representative slice of the stdlib so a regression in any
+          # of these (import system, ssl certs, codecs, JSON, sqlite, zlib)
+          # fails the build.
+          "$exe" -c "import sys, os, json, ssl, codecs, sqlite3, zlib, hashlib, urllib.parse; print('python', sys.version.split()[0]); print('stdlib smoke OK')"
+
+      - name: Upload bundle on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed_bundle-${{ matrix.os }}-${{ github.run_id }}
+          path: dist/embed_bundle/
+          if-no-files-found: ignore
