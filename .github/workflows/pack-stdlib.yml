@@ -25,11 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-2025
+          - os: windows-2025-vs2026
             artifact: MonolithPy314_windows_x64
           - os: macos-26
-            # macos-26 runners are arm64. mac_x86_64 also exists upstream
-            # if x86_64 coverage is wanted later.
             artifact: MonolithPy314_mac_arm64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -57,13 +55,11 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          # actions/upload-artifact strips the executable bit. Re-set it
-          # on python and any compiled tooling shipped in the install.
           find monolithpy314 -type f \( -name 'python' -o -name 'python3' \
               -o -name 'python3.*' \) -exec chmod +x {} \;
 
       - name: Pack stdlib-only bundle
-        run: python pack_embed.py --keep-build
+        run: python pack_embed.py
 
       - name: Set up MSVC for sample build
         if: runner.os == 'Windows'
@@ -74,13 +70,8 @@ jobs:
       - name: Build sample exe
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-              cmake -S dist/embed_bundle/samples -B sample_build \
-                  -G "Visual Studio 17 2022" -A x64
-          else
-              cmake -S dist/embed_bundle/samples -B sample_build \
-                  -DCMAKE_BUILD_TYPE=Release
-          fi
+          cmake -S dist/embed_bundle/samples -B sample_build \
+              -DCMAKE_BUILD_TYPE=Release
           cmake --build sample_build --config Release
 
       - name: Smoke-test sample exe
@@ -95,15 +86,141 @@ jobs:
               exit 1
           fi
           ls -la "$exe"
-          # Hit a representative slice of the stdlib so a regression in any
-          # of these (import system, ssl certs, codecs, JSON, sqlite, zlib)
-          # fails the build.
           "$exe" -c "import sys, os, json, ssl, codecs, sqlite3, zlib, hashlib, urllib.parse; print('python', sys.version.split()[0]); print('stdlib smoke OK')"
 
-      - name: Upload bundle on failure
-        if: failure()
+      - name: Upload bundle
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: embed_bundle-${{ matrix.os }}-${{ github.run_id }}
           path: dist/embed_bundle/
+          if-no-files-found: ignore
+
+      - name: Upload sample build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed_sample_build-${{ matrix.os }}-${{ github.run_id }}
+          path: sample_build/
+          if-no-files-found: ignore
+
+  pack-universal:
+    name: pack-universal (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Get MonolithPy arm64 artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          repo: Nuitka/MonolithPy
+          workflow: main.yml
+          workflow_conclusion: success
+          branch: 3.14
+          name: MonolithPy314_mac_arm64
+          path: monolithpy-arm64
+
+      - name: Get MonolithPy x86_64 artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          repo: Nuitka/MonolithPy
+          workflow: main.yml
+          workflow_conclusion: success
+          branch: 3.14
+          name: MonolithPy314_mac_x86_64
+          path: monolithpy-x86
+
+      - name: Restore POSIX executable bits
+        shell: bash
+        run: |
+          for d in monolithpy-arm64 monolithpy-x86; do
+            find "$d" -type f \( -name 'python' -o -name 'python3' \
+                -o -name 'python3.*' \) -exec chmod +x {} \;
+          done
+
+      - name: Pack arm64 bundle
+        run: python pack_embed.py --install monolithpy-arm64 --out-dir dist/embed-arm64
+
+      - name: Pack x86_64 bundle
+        run: python pack_embed.py --install monolithpy-x86 --out-dir dist/embed-x86
+
+      - name: Lipo into universal bundle
+        run: python pack_embed.py --lipo dist/embed-arm64 dist/embed-x86 --out-dir dist/embed_bundle
+
+      - name: Build universal sample
+        shell: bash
+        run: |
+          # Force both slices into the sample exe so we can actually
+          # exercise the x86_64 lipo'd archives - otherwise the runner's
+          # native arch (arm64) is the only one that gets built.
+          cmake -S dist/embed_bundle/samples -B sample_build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build sample_build --config Release
+
+      - name: Smoke-test universal sample
+        shell: bash
+        run: |
+          exe=$(find sample_build -type f -name 'embed_sample' | head -1)
+          if [ -z "$exe" ]; then
+              echo "embed_sample binary not found under sample_build/"
+              find sample_build -maxdepth 4 -type f
+              exit 1
+          fi
+          ls -la "$exe"
+          # Assert the binary is actually fat - a single-arch binary
+          # would still smoke-test OK on its native arch but defeats
+          # the point of the universal bundle.
+          lipo -info "$exe"
+          lipo -info "$exe" | grep -q 'arm64' || { echo 'missing arm64 slice'; exit 1; }
+          lipo -info "$exe" | grep -q 'x86_64' || { echo 'missing x86_64 slice'; exit 1; }
+          # Make sure Rosetta is available so arch -x86_64 works on the
+          # arm64 runner; it's preinstalled on macos-14+, but install
+          # defensively in case the runner image changes.
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+              softwareupdate --install-rosetta --agree-to-license
+          fi
+          for slice in arm64 x86_64; do
+              echo "=== smoke-testing $slice slice ==="
+              arch -"$slice" "$exe" -c "import sys, os, json, ssl, codecs, sqlite3, zlib, hashlib, urllib.parse; print('python', sys.version.split()[0]); print('machine', os.uname().machine); print('stdlib smoke OK')"
+          done
+
+      - name: Upload arm64 bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed_bundle-macos-arm64-${{ github.run_id }}
+          path: dist/embed-arm64/
+          if-no-files-found: ignore
+
+      - name: Upload x86_64 bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed_bundle-macos-x86_64-${{ github.run_id }}
+          path: dist/embed-x86/
+          if-no-files-found: ignore
+
+      - name: Upload universal bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed_bundle-macos-universal-${{ github.run_id }}
+          path: dist/embed_bundle/
+          if-no-files-found: ignore
+
+      - name: Upload universal sample build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed_sample_build-macos-universal-${{ github.run_id }}
+          path: sample_build/
           if-no-files-found: ignore

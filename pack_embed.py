@@ -27,9 +27,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -84,14 +86,16 @@ _VFS_EXCLUDE_EXTS = {
 
 _VFS_EXCLUDE_SUFFIXES = (".lib.link.json", ".lib.orig",
                          ".a.link.json", ".a.orig")
-_VFS_EXCLUDE_DIR_NAMES = {"tests"}
+# Includes both spellings: the stdlib uses `test/` (singular, ~36 MB),
+# numpy / scipy / setuptools etc. use `tests/` (plural).
+_VFS_EXCLUDE_DIR_NAMES = {"tests", "test"}
 
 
 def _vfs_ignore(src: str, names: list[str]) -> list[str]:
     """shutil.copytree filter: drop linker artifacts and per-package test
     fixture directories before they hit the VFS. The test directories
-    (e.g. numpy/tests, scipy/tests) carry hundreds of MB of test data
-    fixtures that aren't needed at runtime."""
+    (CPython's Lib/test/, numpy/tests/, scipy/tests/, etc.) carry hundreds
+    of MB of fixtures not needed at runtime."""
     skipped = []
     for name in names:
         # `.lib.link.json` and `.lib.orig` don't match an .ext via splitext.
@@ -102,11 +106,21 @@ def _vfs_ignore(src: str, names: list[str]) -> list[str]:
         if ext in _VFS_EXCLUDE_EXTS:
             skipped.append(name)
             continue
-        # Drop any `tests` subdirectory (only when it's actually a directory -
-        # a stray `tests` file would still come through).
+        # Drop `test` / `tests` subdirectories (only when actually directories -
+        # a stray file with that name would still come through).
         if name in _VFS_EXCLUDE_DIR_NAMES and os.path.isdir(os.path.join(src, name)):
             skipped.append(name)
     return skipped
+
+
+def _file_hash(p: pathlib.Path) -> str:
+    """sha256 of a file's contents. Used to dedup static libs that the
+    upstream install duplicates across dependency_libs/<X>/lib trees."""
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def stage_embed_tree(install: pathlib.Path, staging: pathlib.Path) -> None:
@@ -141,7 +155,11 @@ def stage_embed_tree(install: pathlib.Path, staging: pathlib.Path) -> None:
     relroot = staging / "__relative__"
     relroot.mkdir()
 
-    # Copy the stdlib, preserving .pyc under __pycache__.
+    # Copy the stdlib into the VFS under the ~/Lib/ namespace.
+    # At runtime the embed binary must live at the install prefix so
+    # its execfolder matches, making get_virtual_path rewrite prefix-
+    # rooted paths like <prefix>/lib/python3.14/ to ~/lib/python3.14/
+    # which hits these entries after lowercasing.
     src_lib = install / "Lib"
     if src_lib.is_dir():
         print(f"  staging Lib from {src_lib}")
@@ -169,14 +187,43 @@ def stage_embed_tree(install: pathlib.Path, staging: pathlib.Path) -> None:
                 shutil.copy2(sub, dst)
 
 
+def _find_file(install: pathlib.Path, basename: str) -> pathlib.Path:
+    """Search for a file under the install tree. The CI artifact layout may
+    place files differently than a local build, so crawl if the obvious
+    spot misses."""
+    # Common locations in priority order.
+    candidates = [
+        install / basename,                            # root
+        install / "bin" / basename,                    # POSIX bin/
+        install / "Lib" / basename,                    # Windows Lib/
+        install / "lib" / "python3.14" / basename,     # POSIX site-level
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    # Fall back to a glob (handles other python versions / custom layouts).
+    for f in install.rglob(basename):
+        if f.is_file():
+            return f
+    raise SystemExit(f"{basename} not found under {install}")
+
+
+def _find_python(install: pathlib.Path) -> pathlib.Path:
+    """Locate the monolithpy python executable."""
+    # The CI artifact uses bin/python3.14; local dev builds may have python.exe
+    # at the root.
+    for name in ("python3.14", "python3", "python.exe"):
+        try:
+            return _find_file(install, name)
+        except SystemExit:
+            pass
+    raise SystemExit(f"no python binary found under {install}")
+
+
 def run_mkembeddata(install: pathlib.Path, staging: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
     """Invoke the monolithpy python's own mkembeddata.py on the staging tree."""
-    script = install / "Lib" / "mkembeddata.py"
-    if not script.is_file():
-        raise SystemExit(f"mkembeddata.py not found under {install}")
-    py = install / "python.exe"
-    if not py.is_file():
-        raise SystemExit(f"python.exe not found under {install}")
+    script = _find_file(install, "mkembeddata.py")
+    py = _find_python(install)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  running mkembeddata ({py.name}) over {staging}")
@@ -189,8 +236,9 @@ def run_mkembeddata(install: pathlib.Path, staging: pathlib.Path, out_dir: pathl
 
 def write_embed_coff(out_obj: pathlib.Path,
                      map_dat: pathlib.Path,
-                     data_dat: pathlib.Path) -> None:
-    """Hand-emit a COFF/x86_64 .obj that exports the four symbols mp_embed.c
+                     data_dat: pathlib.Path,
+                     arch: str = "x86_64") -> None:
+    """Hand-emit a COFF .obj that exports the four symbols mp_embed.c
     needs: nuitka_embed_map, nuitka_embed_data, nuitka_embed_map_len,
     nuitka_embed_data_len. Three .rdata sections - one per blob plus one for
     the two 32-bit lengths - keep raw-data layout simple and let the linker
@@ -208,7 +256,15 @@ def write_embed_coff(out_obj: pathlib.Path,
     import struct
 
     # ---- COFF format constants ----
-    IMAGE_FILE_MACHINE_AMD64 = 0x8664
+    _coff_machines = {
+        "x86_64":  0x8664,   # IMAGE_FILE_MACHINE_AMD64
+        "amd64":   0x8664,
+        "arm64":   0xAA64,   # IMAGE_FILE_MACHINE_ARM64
+        "aarch64": 0xAA64,
+    }
+    machine = _coff_machines.get(arch.lower())
+    if machine is None:
+        raise ValueError(f"unsupported COFF arch: {arch!r}")
     IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
     IMAGE_SCN_ALIGN_8BYTES         = 0x00400000
     IMAGE_SCN_MEM_READ             = 0x40000000
@@ -259,7 +315,7 @@ def write_embed_coff(out_obj: pathlib.Path,
         # File header
         out.write(struct.pack(
             "<HHIIIHH",
-            IMAGE_FILE_MACHINE_AMD64,
+            machine,
             num_sections,
             0,                  # TimeDateStamp
             symtab_off,
@@ -618,6 +674,41 @@ def write_embed_macho(out_obj: pathlib.Path,
         out.write(bytes(strtab))
 
 
+def _detect_target_arch(install: pathlib.Path) -> str:
+    """Detect the TARGET architecture from the MonolithPy install's python
+    binary, NOT the host architecture. This is critical for cross-arch
+    packing (e.g. x86_64 artifact on an arm64 Mac)."""
+    py = _find_python(install)
+    import struct
+    data = py.read_bytes()
+    if len(data) < 4:
+        raise SystemExit(f"cannot read python binary: {py}")
+    magic = struct.unpack_from("<I", data, 0)[0]
+    off = 4
+    # Mach-O FAT headers are always stored big-endian: real bytes are
+    # CA FE BA BE (32-bit) or CA FE BA BF (64-bit). When the leading 4
+    # bytes are little-endian-unpacked, they appear as the CIGAM constants
+    # 0xBEBAFECA / 0xBFBAFECA; the rest of the FAT header is still BE.
+    if magic in (0xBEBAFECA, 0xBFBAFECA):  # Mach-O FAT (32/64-bit)
+        off += 4  # skip narch
+        cputype = struct.unpack_from(">I", data, off)[0]
+    elif magic == 0xFEEDFACF:  # MH_MAGIC_64
+        cputype = struct.unpack_from("<I", data, 4)[0]
+    elif magic == 0xFEEDFACE:  # MH_MAGIC
+        cputype = struct.unpack_from("<I", data, 4)[0]
+    elif magic == 0x7F454C46:  # ELF
+        e_machine = struct.unpack_from("<H", data, 18)[0]
+        return {62: "x86_64", 183: "aarch64"}.get(e_machine, f"elf_machine_{e_machine}")
+    else:
+        import platform
+        return {
+            "amd64": "x86_64", "x86_64": "x86_64",
+            "arm64": "arm64", "aarch64": "aarch64",
+        }.get(platform.machine().lower(), platform.machine().lower())
+    return {0x01000007: "x86_64", 0x0100000C: "arm64"}.get(
+        cputype, f"cputype_{cputype}")
+
+
 def _host_object_format() -> str:
     """Pick the object-file format for the current host."""
     if sys.platform == "win32":
@@ -625,21 +716,6 @@ def _host_object_format() -> str:
     if sys.platform == "darwin":
         return "macho"
     return "elf"
-
-
-def _host_arch() -> str:
-    """Normalize platform.machine() into the names our writers accept.
-
-    On macOS the canonical name is `arm64`; on Linux it's `aarch64`. The
-    writers accept either spelling, so we just return whatever's natural
-    for the host."""
-    import platform
-    m = platform.machine().lower()
-    if m in ("amd64", "x86_64"):
-        return "x86_64"
-    if m in ("arm64", "aarch64"):
-        return "arm64" if sys.platform == "darwin" else "aarch64"
-    return m
 
 
 def write_embed_object(out_obj: pathlib.Path,
@@ -650,9 +726,15 @@ def write_embed_object(out_obj: pathlib.Path,
     """Pick the host's native object format and emit the four nuitka_embed_*
     symbols. fmt/arch override host detection for cross-emission."""
     fmt = fmt or _host_object_format()
-    arch = arch or _host_arch()
+    if arch is None:
+        import platform
+        arch = platform.machine().lower()
+        if arch in ("amd64", "x86_64"):
+            arch = "x86_64"
+        elif arch in ("arm64", "aarch64"):
+            arch = "arm64" if sys.platform == "darwin" else "aarch64"
     if fmt == "coff":
-        write_embed_coff(out_obj, map_dat, data_dat)
+        write_embed_coff(out_obj, map_dat, data_dat, arch)
     elif fmt == "elf":
         write_embed_elf(out_obj, map_dat, data_dat, arch)
     elif fmt == "macho":
@@ -748,6 +830,21 @@ def resolve_libs(link_json: dict, install: pathlib.Path) -> tuple[list[str], lis
     return libs, lib_dirs, cleaned_flags
 
 
+def _ensure_link_json(install: pathlib.Path) -> None:
+    """If link.json is absent, generate it by running rebuildpython.
+
+    A pristine MonolithPy install (straight from CI) lacks link.json until
+    the first pip-installed package triggers the rebuild hook. The packer
+    needs it to discover which static libs the interpreter links against.
+    """
+    link_json = install / "link.json"
+    if link_json.is_file():
+        return
+    py = _find_python(install)
+    print("  link.json missing; running rebuildpython to generate it")
+    subprocess.check_call([str(py), "-m", "rebuildpython"])
+
+
 def build_bundle(install: pathlib.Path, build: pathlib.Path,
                  out_dir: pathlib.Path, pybind11_root: pathlib.Path) -> None:
     """Assemble the bundle directory: copy headers + libs into place, build
@@ -768,6 +865,7 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
     bundle_lib = out_dir / "lib"
     bundle_lib.mkdir()
 
+    _ensure_link_json(install)
     link_json = json.loads((install / "link.json").read_text())
     libs, lib_dirs, link_flags = resolve_libs(link_json, install)
 
@@ -781,17 +879,28 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
             lib_dirs.append(str(extra))
 
     # Filter the install's default mp_embed_data archive - we replace it
-    # with the freshly generated one (with the user's full VFS blob). Match
-    # both the Windows (`mp_embed_data.lib`) and POSIX (`libmp_embed_data.a`)
-    # naming.
+    # with the freshly generated one (with the user's full VFS blob).
+    #
+    # On macOS the artifact's libmp_embed.a also bundles a stale
+    # mp_embed_data.o (carrying only the original SSL-cert VFS), so it
+    # has to be filtered too or it shadows our fresh data at link time.
+    # On Windows mp_embed.lib bundles mp_embed.obj + mp_embed_cpp.obj +
+    # the zstd_objs/ that provide ZSTD_decompress et al., and there's no
+    # stale data inside it - filtering it would lose every zstd symbol.
     _embed_data_basenames = {"mp_embed_data.lib", "libmp_embed_data.a"}
+    if sys.platform != "win32":
+        _embed_data_basenames.add("libmp_embed.a")
     libs = [l for l in libs
             if os.path.basename(l).lower() not in _embed_data_basenames]
 
     install_str = str(install)
     bundled_libs = []  # bundle-relative .lib paths in link order
     bundled_sys_libs = []  # bare system-lib names like "kernel32"
-    seen_bundled = set()
+    # Upstream MonolithPy ships every dep into every other dep's prefix,
+    # so link.json can list 30+ byte-identical copies of libcrypto.a /
+    # libexpat.a / libtclstub.a across dependency_libs/<X>/lib trees.
+    # Dedup by content hash so the bundle isn't bloated 30x.
+    content_seen = {}  # sha256 -> bundle-relative path
 
     def _resolve_lib(name: str) -> pathlib.Path | None:
         if os.path.isabs(name) and os.path.isfile(name):
@@ -808,6 +917,34 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
                     return cand
         return None
 
+    def _rebase_resolved(resolved: pathlib.Path) -> pathlib.Path:
+        try:
+            return resolved.resolve().relative_to(install_str)
+        except ValueError:
+            # External path (rare). Drop it directly under lib/external/.
+            return pathlib.Path("external") / resolved.name
+
+    # First pass: hash each resolved lib once and pick a canonical
+    # bundle-relative path for each content hash (lex-min across all
+    # paths that share the same content). This is what makes per-arch
+    # bundles structurally identical, which lipo_bundles relies on.
+    abs_to_hash: dict[str, str] = {}
+    canonical_rel: dict[str, str] = {}
+    for lib in libs:
+        resolved = _resolve_lib(lib)
+        if resolved is None:
+            continue
+        abs_path = str(resolved.resolve())
+        h = abs_to_hash.get(abs_path)
+        if h is None:
+            h = _file_hash(resolved)
+            abs_to_hash[abs_path] = h
+        rel_posix = _rebase_resolved(resolved).as_posix()
+        if h not in canonical_rel or rel_posix < canonical_rel[h]:
+            canonical_rel[h] = rel_posix
+
+    # Second pass: walk libs in link order, dedup by content hash, copy
+    # to the canonical rel path.
     for lib in libs:
         resolved = _resolve_lib(lib)
         if resolved is None:
@@ -817,19 +954,16 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
             if base not in bundled_sys_libs:
                 bundled_sys_libs.append(base)
             continue
-        try:
-            rel = resolved.resolve().relative_to(install_str)
-        except ValueError:
-            # External path (rare). Drop it directly under lib/external/.
-            rel = pathlib.Path("external") / resolved.name
-        dest = bundle_lib / rel
-        if dest in seen_bundled:
+        h = abs_to_hash[str(resolved.resolve())]
+        if h in content_seen:
             continue
+        rel_posix = canonical_rel[h]
+        dest = bundle_lib / rel_posix
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists():
             shutil.copy2(resolved, dest)
-        seen_bundled.add(dest)
-        bundled_libs.append(rel.as_posix())
+        bundled_libs.append(rel_posix)
+        content_seen[h] = rel_posix
 
     # ---- Generate the VFS-blob static lib in bundle/lib/ ----
     map_dat = build / "map.dat"
@@ -839,7 +973,8 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
             "mkembeddata did not write map.dat / data.dat next to mp_embed_data.c")
     obj_ext = ".obj" if sys.platform == "win32" else ".o"
     embed_obj = build / f"mp_embed_data{obj_ext}"
-    write_embed_object(embed_obj, map_dat, data_dat)
+    target_arch = _detect_target_arch(install)
+    write_embed_object(embed_obj, map_dat, data_dat, arch=target_arch)
 
     # Locate the install's prebuilt mp_embed runtime object. build.bat emits
     # .obj on Windows; the equivalent POSIX build emits .o.
@@ -864,7 +999,10 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
     print(f"  combining embed VFS blob + runtime into {new_embed_lib.name}")
     _build_static_lib(install, build, new_embed_lib,
                       [embed_obj, install_runtime_obj])
-    bundled_libs.append(embed_lib_name)
+    # Must come FIRST so the linker resolves nuitka_embed_* from our
+    # freshly generated blob, not from the stale copy inside the
+    # artifact's lib/libmp_embed.a (which only carries SSL certs).
+    bundled_libs.insert(0, embed_lib_name)
 
     # ---- Write src/staticinit_stub.c ----
     bundle_src = out_dir / "src"
@@ -898,29 +1036,26 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
 
 def _build_static_lib(install: pathlib.Path, build: pathlib.Path,
                       out_lib: pathlib.Path, objs: list) -> None:
-    """Drive distutils' ccompiler from the install python to build a .lib /
-    .a archive from a list of object files."""
-    driver = build / "_make_lib.py"
-    payload = {
-        "objs": [str(p) for p in objs],
-        "out_lib_dir": str(out_lib.parent),
-        "out_lib_stem": out_lib.stem,
-    }
-    driver.write_text(f"""
-import json, os
-import setuptools._distutils.ccompiler as ccompiler
-cfg = {json.dumps(payload, indent=2)}
-compiler = ccompiler.new_compiler(verbose=5)
-try: compiler.initialize()
-except AttributeError: pass
-os.makedirs(cfg['out_lib_dir'], exist_ok=True)
-compiler.create_static_lib(cfg['objs'], cfg['out_lib_stem'],
-                           output_dir=cfg['out_lib_dir'])
-""")
-    py = install / "python.exe"
-    if not py.is_file():
-        py = install / "bin" / "python3"
-    subprocess.check_call([str(py), str(driver)], cwd=str(build))
+    """Build a static library archive from a list of object files.
+
+    Uses the system `ar` + `ranlib` (POSIX) or `lib` (Windows). Avoids
+    distutils because MonolithPy cross-arch installs may lack a working
+    ranlib for the target arch."""
+    out_lib.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        lib_exe = shutil.which("lib.exe")
+        if lib_exe is None:
+            lib_exe = shutil.which("llvm-lib.exe")
+        if lib_exe is None:
+            raise SystemExit("lib.exe / llvm-lib.exe not on PATH")
+        subprocess.check_call(
+            [lib_exe, f"/OUT:{out_lib}"] + [str(o) for o in objs])
+    else:
+        ar = shutil.which("ar")
+        if ar is None:
+            raise SystemExit("ar not on PATH")
+        subprocess.check_call(
+            [ar, "rcs", str(out_lib)] + [str(o) for o in objs])
 
 
 def write_cmake_module(out_dir: pathlib.Path, bundled_libs: list[str],
@@ -940,11 +1075,33 @@ def write_cmake_module(out_dir: pathlib.Path, bundled_libs: list[str],
     sys_libs_cmake = "\n".join(f'        "{l}"' for l in bundled_sys_libs)
     res_cmake = "\n".join(f'        "${{MP_BUNDLE_DIR}}/lib/{r}"' for r in res_files)
 
-    # Filter the link_flags down to the safe-cross-platform ones; turn the
-    # paths-to-.res files into source files (we already pulled those out).
-    flags_cmake = "\n".join(
-        f'        "{f}"' for f in extra_link_flags if not f.lower().endswith(".res")
-    )
+    # Pull -framework / FrameworkName pairs out of link_flags into a
+    # separate list so the CMake module can emit them as -Wl,-framework,X
+    # (single arg) — bare "-framework" / "X" pairs in target_link_options
+    # get misinterpreted as filenames by the macOS Makefile generator.
+    # Skip .res entries too (we already moved those into res_files).
+    frameworks = []
+    filtered_flags = []
+    i = 0
+    while i < len(extra_link_flags):
+        f = extra_link_flags[i]
+        if f == "-framework" and i + 1 < len(extra_link_flags):
+            frameworks.append(extra_link_flags[i + 1])
+            i += 2
+            continue
+        if f.lower().endswith(".res"):
+            i += 1
+            continue
+        filtered_flags.append(f)
+        i += 1
+    flags_cmake = "\n".join(f'        "{f}"' for f in filtered_flags)
+    frameworks_cmake = "\n".join(f'        "{fw}"' for fw in frameworks)
+
+    # Find versioned header dirs under include/ (e.g. python3.14/).
+    extra_include = ""
+    for d in sorted((out_dir / "include").iterdir()):
+        if d.is_dir() and (d / "Python.h").is_file():
+            extra_include += f'\nset(MP_BUNDLE_PYTHON_INCLUDE_DIR "${{MP_BUNDLE_DIR}}/include/{d.name}")'
 
     module = (out_dir / "MonolithPyEmbed.cmake")
     module.write_text(f"""# Auto-generated by pack_embed.py - do not edit.
@@ -967,6 +1124,7 @@ get_filename_component(MP_BUNDLE_DIR "${{CMAKE_CURRENT_LIST_DIR}}" ABSOLUTE)
 set(MP_BUNDLE_INCLUDE_DIR    "${{MP_BUNDLE_DIR}}/include")
 set(MP_BUNDLE_LIB_DIR        "${{MP_BUNDLE_DIR}}/lib")
 set(MP_BUNDLE_SRC_DIR        "${{MP_BUNDLE_DIR}}/src")
+{extra_include}
 
 set(MP_BUNDLE_LIBS
 {libs_cmake}
@@ -980,6 +1138,10 @@ set(MP_BUNDLE_LINK_FLAGS
 {flags_cmake}
 )
 
+set(MP_BUNDLE_FRAMEWORKS
+{frameworks_cmake}
+)
+
 set(MP_BUNDLE_RES_FILES
 {res_cmake}
 )
@@ -987,6 +1149,7 @@ set(MP_BUNDLE_RES_FILES
 function(monolithpy_embed_link target)
     target_include_directories(${{target}} PRIVATE
         "${{MP_BUNDLE_INCLUDE_DIR}}"
+        "${{MP_BUNDLE_PYTHON_INCLUDE_DIR}}"
     )
 
     # The staticinit stub is compiled with -DPy_BUILD_CORE so that the
@@ -1005,23 +1168,17 @@ function(monolithpy_embed_link target)
                                               ${{MP_BUNDLE_RES_FILES}})
     target_link_options(${{target}} PRIVATE ${{MP_BUNDLE_LINK_FLAGS}})
 
+    # macOS frameworks come straight from the install's link.json -
+    # passing through -Wl,-framework,X as a single linker arg avoids the
+    # Makefile generator splitting "-framework"/"X" into bare filenames.
+    foreach(_mp_fw IN LISTS MP_BUNDLE_FRAMEWORKS)
+        target_link_libraries(${{target}} PRIVATE "-Wl,-framework,${{_mp_fw}}")
+    endforeach()
+
     if(WIN32)
         set_property(TARGET ${{target}} PROPERTY
             MSVC_RUNTIME_LIBRARY "MultiThreaded")
-    elseif(APPLE)
-        # Frameworks MonolithPy depends on for macOS.
-        target_link_libraries(${{target}} PRIVATE
-            "-framework SystemConfiguration"
-            "-framework CoreFoundation"
-            "-framework Cocoa"
-            "-framework Carbon"
-            "-framework IOKit"
-            "-framework QuartzCore"
-            "-framework CoreServices"
-            "-framework ApplicationServices"
-            "-framework UniformTypeIdentifiers"
-        )
-    else()
+    elseif(UNIX AND NOT APPLE)
         # Linux: standard libc/pthread/dl support libs.
         target_link_libraries(${{target}} PRIVATE m pthread dl util)
     endif()
@@ -1156,9 +1313,11 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
     """Merge two per-arch macOS bundles into one universal bundle.
 
     For every static library that exists in both inputs, we run `lipo -create`
-    to produce a fat archive. Headers and the CMake module come from the arm64
-    input verbatim (they're identical between the arches). System lib names
-    in the CMake module reference frameworks / dylibs and need no merging.
+    to produce a fat archive. Headers come from the arm64 input verbatim
+    (identical between arches). The CMake module is copied from arm64 but
+    its arm64-specific `-arch arm64` link flags are stripped, since the
+    universal bundle's static libs are fat and the consumer's CMake project
+    should drive arch selection via CMAKE_OSX_ARCHITECTURES.
     """
     if shutil.which("lipo") is None:
         raise SystemExit(
@@ -1166,8 +1325,14 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
     if out.exists():
         shutil.rmtree(out)
 
+    # Skip arm64/lib/ at the TOP LEVEL only; nested "lib" dirs anywhere
+    # else in the bundle (e.g. include/.../lib/) must survive.
+    arm64_resolved = str(arm64.resolve())
+    def _skip_toplevel_lib(src: str, names: list[str]) -> list[str]:
+        return ["lib"] if os.path.realpath(src) == arm64_resolved else []
+
     print(f"  copying scaffold from {arm64}")
-    shutil.copytree(arm64, out, ignore=lambda _, names: ["lib"])
+    shutil.copytree(arm64, out, ignore=_skip_toplevel_lib)
     (out / "lib").mkdir()
 
     arm_libs = {p.relative_to(arm64 / "lib"): p
@@ -1177,12 +1342,23 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
                 for p in (x86_64 / "lib").rglob("*")
                 if p.is_file() and p.suffix in (".a", ".lib")}
 
-    only_arm = arm_libs.keys() - x86_libs.keys()
-    only_x86 = x86_libs.keys() - arm_libs.keys()
-    if only_arm:
-        print(f"  warning: {len(only_arm)} libs only in arm64 (will be dropped)")
-    if only_x86:
-        print(f"  warning: {len(only_x86)} libs only in x86_64 (will be dropped)")
+    only_arm = sorted(arm_libs.keys() - x86_libs.keys())
+    only_x86 = sorted(x86_libs.keys() - arm_libs.keys())
+    if only_arm or only_x86:
+        # Dropping single-arch libs would silently produce a universal
+        # binary missing symbols on one slice. Bail loudly instead.
+        msg = ["lipo: bundle contents diverge between arches"]
+        if only_arm:
+            msg.append(f"  only in arm64 ({len(only_arm)}):")
+            msg.extend(f"    {p}" for p in only_arm[:10])
+            if len(only_arm) > 10:
+                msg.append(f"    ... +{len(only_arm) - 10} more")
+        if only_x86:
+            msg.append(f"  only in x86_64 ({len(only_x86)}):")
+            msg.extend(f"    {p}" for p in only_x86[:10])
+            if len(only_x86) > 10:
+                msg.append(f"    ... +{len(only_x86) - 10} more")
+        raise SystemExit("\n".join(msg))
 
     common = sorted(arm_libs.keys() & x86_libs.keys())
     print(f"  lipo'ing {len(common)} libraries")
@@ -1194,6 +1370,14 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
             str(arm_libs[rel]), str(x86_libs[rel]),
             "-output", str(dest),
         ])
+
+    # Strip arm64-only flags from the copied CMake module so a consumer
+    # CMake project's CMAKE_OSX_ARCHITECTURES governs the slice selection.
+    cmake_file = out / "MonolithPyEmbed.cmake"
+    if cmake_file.is_file():
+        text = cmake_file.read_text()
+        text = re.sub(r'        "-arch"\n        "[^"]+"\n', '', text)
+        cmake_file.write_text(text)
 
     print(f"\nUniversal bundle: {out}")
     _print_bundle_summary(out)
@@ -1212,11 +1396,7 @@ def main() -> None:
     install = pathlib.Path(args.install).resolve()
     pybind11_root = pathlib.Path(args.pybind11).resolve()
 
-    py_exe = install / "python.exe"
-    if not py_exe.is_file():
-        py_exe = install / "bin" / "python3"
-    if not py_exe.is_file():
-        raise SystemExit(f"No python.exe / python3 under {install}")
+    _find_python(install)  # validate early
     if not (pybind11_root / "include" / "pybind11" / "embed.h").is_file():
         raise SystemExit(f"pybind11 headers not found at {pybind11_root}")
 
