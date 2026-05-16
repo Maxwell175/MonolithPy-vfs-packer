@@ -104,8 +104,16 @@ jobs:
           path: sample_build/
           if-no-files-found: ignore
 
-  pack-universal:
-    name: pack-universal (macos-26)
+  pack-universal-arch:
+    name: pack-universal-${{ matrix.arch }} (macos-26)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            artifact: MonolithPy314_mac_arm64
+          - arch: x86_64
+            artifact: MonolithPy314_mac_x86_64
     runs-on: macos-26
     timeout-minutes: 60
 
@@ -118,39 +126,62 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Get MonolithPy arm64 artifact
+      - name: Get MonolithPy ${{ matrix.arch }} artifact
         uses: dawidd6/action-download-artifact@v6
         with:
           repo: Nuitka/MonolithPy
           workflow: main.yml
           workflow_conclusion: success
           branch: 3.14
-          name: MonolithPy314_mac_arm64
-          path: monolithpy-arm64
-
-      - name: Get MonolithPy x86_64 artifact
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          repo: Nuitka/MonolithPy
-          workflow: main.yml
-          workflow_conclusion: success
-          branch: 3.14
-          name: MonolithPy314_mac_x86_64
-          path: monolithpy-x86
+          name: ${{ matrix.artifact }}
+          # rebuildpython writes absolute paths into link.json. The two
+          # matrix legs run on separate runners, so use the same install
+          # path for both arches to keep generated bundle structure stable.
+          path: monolithpy314
 
       - name: Restore POSIX executable bits
         shell: bash
         run: |
-          for d in monolithpy-arm64 monolithpy-x86; do
-            find "$d" -type f \( -name 'python' -o -name 'python3' \
-                -o -name 'python3.*' \) -exec chmod +x {} \;
-          done
+          find monolithpy314 -type f \( -name 'python' -o -name 'python3' \
+              -o -name 'python3.*' \) -exec chmod +x {} \;
 
-      - name: Pack arm64 bundle
-        run: python pack_embed.py --install monolithpy-arm64 --out-dir dist/embed-arm64
+      - name: Pack ${{ matrix.arch }} bundle
+        # Keep the output path identical too; the uploaded artifact name
+        # distinguishes arches after each isolated matrix job completes.
+        run: python pack_embed.py --install monolithpy314 --out-dir dist/embed_bundle
 
-      - name: Pack x86_64 bundle
-        run: python pack_embed.py --install monolithpy-x86 --out-dir dist/embed-x86
+      - name: Upload ${{ matrix.arch }} bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed_bundle-macos-${{ matrix.arch }}-${{ github.run_id }}
+          path: dist/embed_bundle/
+          if-no-files-found: ignore
+
+  pack-universal-merge:
+    name: pack-universal-merge (macos-26)
+    needs: pack-universal-arch
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Download arm64 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: embed_bundle-macos-arm64-${{ github.run_id }}
+          path: dist/embed-arm64
+
+      - name: Download x86_64 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: embed_bundle-macos-x86_64-${{ github.run_id }}
+          path: dist/embed-x86
 
       - name: Lipo into universal bundle
         run: python pack_embed.py --lipo dist/embed-arm64 dist/embed-x86 --out-dir dist/embed_bundle
@@ -192,22 +223,6 @@ jobs:
               echo "=== smoke-testing $slice slice ==="
               arch -"$slice" "$exe" -c "import sys, os, json, ssl, codecs, sqlite3, zlib, hashlib, urllib.parse; print('python', sys.version.split()[0]); print('machine', os.uname().machine); print('stdlib smoke OK')"
           done
-
-      - name: Upload arm64 bundle
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: embed_bundle-macos-arm64-${{ github.run_id }}
-          path: dist/embed-arm64/
-          if-no-files-found: ignore
-
-      - name: Upload x86_64 bundle
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: embed_bundle-macos-x86_64-${{ github.run_id }}
-          path: dist/embed-x86/
-          if-no-files-found: ignore
 
       - name: Upload universal bundle
         if: always()
