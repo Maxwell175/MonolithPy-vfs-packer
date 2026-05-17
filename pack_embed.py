@@ -5,10 +5,8 @@ Output is a directory tree:
     <out>/
       MonolithPyEmbed.cmake     # `monolithpy_embed_link(<target>)` function
       include/                   # Python.h, mp_embed.h, staticinit.h, pybind11/
-      lib/                       # all required .lib / .a files in their
-                                 # original subdirectories (core, deps, tcl,
-                                 # site-packages); plus mp_embed_data.lib,
-                                 # the generated VFS blob.
+      lib/                       # all required .lib files on Windows, or one
+                                 # aggregate libmonolithpy_bundle.a on POSIX.
       src/staticinit_stub.c      # bridges Py_BUILD_CORE-gated
                                  # Py_InitStaticModules to user TUs
       samples/                   # main.cpp + CMakeLists.txt smoke test
@@ -18,10 +16,10 @@ Usage:
         Defaults: ./monolithpy314 and ./dist/embed_bundle/
 
     pack_embed.py --lipo <bundle_arm64> <bundle_x86_64> --out-dir <universal>
-        macOS-only: lipos every static library between the two per-arch
-        bundles into a universal one. Headers and the CMake module are
-        copied verbatim from the arm64 input. Use after running pack_embed
-        once on each per-arch monolithpy install.
+        macOS-only: lipos the two per-arch aggregate archives into one
+        universal archive. Headers and the CMake module are copied from the
+        arm64 input and normalized. Use after running pack_embed once on each
+        per-arch monolithpy install.
 """
 
 from __future__ import annotations
@@ -39,6 +37,7 @@ import tempfile
 
 
 HERE = pathlib.Path(__file__).resolve().parent
+POSIX_BUNDLE_ARCHIVE = "libmonolithpy_bundle.a"
 
 
 def parse_args() -> argparse.Namespace:
@@ -926,8 +925,7 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
 
     # First pass: hash each resolved lib once and pick a canonical
     # bundle-relative path for each content hash (lex-min across all
-    # paths that share the same content). This is what makes per-arch
-    # bundles structurally identical, which lipo_bundles relies on.
+    # paths that share the same content).
     abs_to_hash: dict[str, str] = {}
     canonical_rel: dict[str, str] = {}
     for lib in libs:
@@ -1004,6 +1002,13 @@ def build_bundle(install: pathlib.Path, build: pathlib.Path,
     # artifact's lib/libmp_embed.a (which only carries SSL certs).
     bundled_libs.insert(0, embed_lib_name)
 
+    # POSIX linkers are happier when MonolithPy's many static archives are
+    # grouped into one archive. It also gives macOS universal builds a single
+    # library to lipo, so arch-specific package archives do not leak warnings
+    # to downstream users.
+    if sys.platform != "win32":
+        bundled_libs = _aggregate_posix_bundle_libs(bundle_lib, bundled_libs)
+
     # ---- Write src/staticinit_stub.c ----
     bundle_src = out_dir / "src"
     bundle_src.mkdir()
@@ -1056,6 +1061,86 @@ def _build_static_lib(install: pathlib.Path, build: pathlib.Path,
             raise SystemExit("ar not on PATH")
         subprocess.check_call(
             [ar, "rcs", str(out_lib)] + [str(o) for o in objs])
+
+
+def _merge_static_archives(archives: list[pathlib.Path],
+                           out_archive: pathlib.Path) -> None:
+    """Merge POSIX static archives into one archive."""
+    if not archives:
+        raise SystemExit(f"no input archives for {out_archive}")
+    out_archive.parent.mkdir(parents=True, exist_ok=True)
+    if out_archive.exists():
+        out_archive.unlink()
+    if len(archives) == 1:
+        shutil.copy2(archives[0], out_archive)
+        return
+
+    if sys.platform == "darwin":
+        libtool = shutil.which("libtool")
+        if libtool is None:
+            raise SystemExit("libtool not on PATH")
+        subprocess.check_call(
+            [libtool, "-static", "-o", str(out_archive)]
+            + [str(a) for a in archives]
+        )
+        return
+
+    ar = shutil.which("ar")
+    if ar is None:
+        raise SystemExit("ar not on PATH")
+    with tempfile.TemporaryDirectory(prefix="pack_embed_ar_") as tmp_s:
+        tmp = pathlib.Path(tmp_s)
+        names = []
+        for i, archive in enumerate(archives):
+            name = f"lib{i}.a"
+            os.symlink(archive.resolve(), tmp / name)
+            names.append(name)
+        script = "\n".join(
+            ["CREATE out.a"]
+            + [f"ADDLIB {name}" for name in names]
+            + ["SAVE", "END", ""]
+        )
+        subprocess.run([ar, "-M"], cwd=tmp, input=script, text=True,
+                       check=True)
+        shutil.move(str(tmp / "out.a"), out_archive)
+
+    ranlib = shutil.which("ranlib")
+    if ranlib is not None:
+        subprocess.check_call([ranlib, str(out_archive)])
+
+
+def _prune_empty_dirs(root: pathlib.Path) -> None:
+    dirs = [p for p in root.rglob("*") if p.is_dir()]
+    for path in sorted(dirs, key=lambda p: len(p.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
+def _aggregate_posix_bundle_libs(bundle_lib: pathlib.Path,
+                                 bundled_libs: list[str]) -> list[str]:
+    if not bundled_libs:
+        return bundled_libs
+    archives = [bundle_lib / rel for rel in bundled_libs]
+    missing = [str(p) for p in archives if not p.is_file()]
+    if missing:
+        raise SystemExit(
+            "cannot aggregate missing static archive(s):\n"
+            + "\n".join(f"  {p}" for p in missing)
+        )
+
+    out_archive = bundle_lib / POSIX_BUNDLE_ARCHIVE
+    print(f"  aggregating {len(archives)} static libraries -> "
+          f"{POSIX_BUNDLE_ARCHIVE}")
+    _merge_static_archives(archives, out_archive)
+
+    for rel in bundled_libs:
+        path = bundle_lib / rel
+        if path != out_archive and path.exists():
+            path.unlink()
+    _prune_empty_dirs(bundle_lib)
+    return [POSIX_BUNDLE_ARCHIVE]
 
 
 def write_cmake_module(out_dir: pathlib.Path, bundled_libs: list[str],
@@ -1312,11 +1397,14 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
                  out: pathlib.Path) -> None:
     """Merge two per-arch macOS bundles into one universal bundle.
 
-    For every static library that exists in both inputs, we run `lipo -create`
-    to produce a fat archive. Headers come from the arm64 input verbatim
-    (identical between arches). The CMake module is copied from arm64 but
-    its arm64-specific `-arch arm64` link flags are stripped, since the
-    universal bundle's static libs are fat and the consumer's CMake project
+    Each input is expected to already contain the per-arch aggregate archive
+    produced by build_bundle(). `lipo -create` combines those two archives into
+    a single universal archive. This allows packages like NumPy to ship
+    arch-specific dispatch archives without exposing wrong-arch static
+    libraries to downstream universal links. Headers come from the arm64 input
+    verbatim (identical between arches). The CMake module is copied from arm64,
+    updated to link the single universal bundle archive, and stripped of
+    arch-specific `-arch ...` link flags, since the consumer's CMake project
     should drive arch selection via CMAKE_OSX_ARCHITECTURES.
     """
     if shutil.which("lipo") is None:
@@ -1335,52 +1423,46 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
     shutil.copytree(arm64, out, ignore=_skip_toplevel_lib)
     (out / "lib").mkdir()
 
-    arm_libs = {p.relative_to(arm64 / "lib"): p
-                for p in (arm64 / "lib").rglob("*")
-                if p.is_file() and p.suffix in (".a", ".lib")}
-    x86_libs = {p.relative_to(x86_64 / "lib"): p
-                for p in (x86_64 / "lib").rglob("*")
-                if p.is_file() and p.suffix in (".a", ".lib")}
-
-    only_arm = sorted(arm_libs.keys() - x86_libs.keys())
-    only_x86 = sorted(x86_libs.keys() - arm_libs.keys())
-    if only_arm or only_x86:
-        # Dropping single-arch libs would silently produce a universal
-        # binary missing symbols on one slice. Bail loudly instead.
-        msg = ["lipo: bundle contents diverge between arches"]
-        if only_arm:
-            msg.append(f"  only in arm64 ({len(only_arm)}):")
-            msg.extend(f"    {p}" for p in only_arm[:10])
-            if len(only_arm) > 10:
-                msg.append(f"    ... +{len(only_arm) - 10} more")
-        if only_x86:
-            msg.append(f"  only in x86_64 ({len(only_x86)}):")
-            msg.extend(f"    {p}" for p in only_x86[:10])
-            if len(only_x86) > 10:
-                msg.append(f"    ... +{len(only_x86) - 10} more")
-        raise SystemExit("\n".join(msg))
-
-    common = sorted(arm_libs.keys() & x86_libs.keys())
-    print(f"  lipo'ing {len(common)} libraries")
-    for rel in common:
-        dest = out / "lib" / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.check_call([
-            "lipo", "-create",
-            str(arm_libs[rel]), str(x86_libs[rel]),
-            "-output", str(dest),
-        ])
+    arm_archive = arm64 / "lib" / POSIX_BUNDLE_ARCHIVE
+    x86_archive = x86_64 / "lib" / POSIX_BUNDLE_ARCHIVE
+    missing = [str(p) for p in (arm_archive, x86_archive) if not p.is_file()]
+    if missing:
+        raise SystemExit(
+            "lipo requires per-arch aggregate archive(s) generated by "
+            "pack_embed.py:\n" + "\n".join(f"  {p}" for p in missing)
+        )
+    universal_archive = out / "lib" / POSIX_BUNDLE_ARCHIVE
+    print(f"  lipo'ing {POSIX_BUNDLE_ARCHIVE}")
+    subprocess.check_call([
+        "lipo", "-create",
+        str(arm_archive), str(x86_archive),
+        "-output", str(universal_archive),
+    ])
 
     # Strip arm64-only flags from the copied CMake module so a consumer
     # CMake project's CMAKE_OSX_ARCHITECTURES governs the slice selection.
     cmake_file = out / "MonolithPyEmbed.cmake"
     if cmake_file.is_file():
         text = cmake_file.read_text()
+        text = _replace_cmake_bundle_libs(text, [POSIX_BUNDLE_ARCHIVE])
         text = re.sub(r'        "-arch"\n        "[^"]+"\n', '', text)
         cmake_file.write_text(text)
 
     print(f"\nUniversal bundle: {out}")
     _print_bundle_summary(out)
+
+
+def _replace_cmake_bundle_libs(text: str, libs: list[str]) -> str:
+    replacement = "\n".join(
+        f'        "${{MP_BUNDLE_DIR}}/lib/{lib}"' for lib in libs
+    )
+    return re.sub(
+        r"(set\(MP_BUNDLE_LIBS\n)(.*?)(\n\))",
+        lambda match: match.group(1) + replacement + match.group(3),
+        text,
+        count=1,
+        flags=re.S,
+    )
 
 
 def main() -> None:

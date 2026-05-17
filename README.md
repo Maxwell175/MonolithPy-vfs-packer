@@ -70,7 +70,8 @@ pack_embed.py [--install DIR] [--out-dir DIR] [--pybind11 DIR] [--keep-build]
     Defaults: ./monolithpy314, ./dist/embed_bundle, ./third_party/pybind11
 
 pack_embed.py --lipo <ARM64_BUNDLE> <X86_64_BUNDLE> --out-dir <UNIVERSAL>
-    macOS-only. Merge two per-arch bundles into a universal one via lipo.
+    macOS-only. Lipo the two per-arch aggregate archives into one universal
+    bundle archive.
     Run pack_embed once on each per-arch MonolithPy install, then this.
 ```
 
@@ -91,9 +92,10 @@ pack_embed.py --lipo <ARM64_BUNDLE> <X86_64_BUNDLE> --out-dir <UNIVERSAL>
    ~1 GB blob exhausts >13 GB of compiler memory; emitting the object
    directly takes a few seconds.
 4. **Archive** - bundle the new object file plus the install's prebuilt
-   `mp_embed` runtime into one static library (`mp_embed_data.lib` /
-   `libmp_embed_data.a`).
-5. **Generate** - write the CMake module that wires every static library,
+   `mp_embed` runtime into a static library, then on POSIX aggregate that
+   runtime archive and every other static library into
+   `libmonolithpy_bundle.a`.
+5. **Generate** - write the CMake module that wires the bundle archive,
    system library, and linker flag MonolithPy needs into a single
    `monolithpy_embed_link(<target>)` function.
 
