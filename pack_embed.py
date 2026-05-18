@@ -1401,11 +1401,17 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
     produced by build_bundle(). `lipo -create` combines those two archives into
     a single universal archive. This allows packages like NumPy to ship
     arch-specific dispatch archives without exposing wrong-arch static
-    libraries to downstream universal links. Headers come from the arm64 input
-    verbatim (identical between arches). The CMake module is copied from arm64,
-    updated to link the single universal bundle archive, and stripped of
-    arch-specific `-arch ...` link flags, since the consumer's CMake project
-    should drive arch selection via CMAKE_OSX_ARCHITECTURES.
+    libraries to downstream universal links. Most headers come from the arm64
+    input verbatim (identical between arches), with one exception:
+    `staticinit.h` is rebuilt from both per-arch copies because MonolithPy
+    mangles each Python extension's `PyInit_*` symbol with a per-arch
+    `__mp__<hash>` suffix, so the arm64 and x86_64 slices of the universal
+    archive expose disjoint symbol sets. Without merging, the arm64 header
+    would reference symbols that don't exist in the x86_64 slice (and vice
+    versa) and a universal link would fail. The CMake module is copied from
+    arm64, updated to link the single universal bundle archive, and stripped
+    of arch-specific `-arch ...` link flags, since the consumer's CMake
+    project should drive arch selection via CMAKE_OSX_ARCHITECTURES.
     """
     if shutil.which("lipo") is None:
         raise SystemExit(
@@ -1448,8 +1454,151 @@ def lipo_bundles(arm64: pathlib.Path, x86_64: pathlib.Path,
         text = re.sub(r'        "-arch"\n        "[^"]+"\n', '', text)
         cmake_file.write_text(text)
 
+    _merge_universal_staticinit(arm64, x86_64, out)
+
     print(f"\nUniversal bundle: {out}")
     _print_bundle_summary(out)
+
+
+_STATICINIT_EXTERN_RE = re.compile(
+    r'^\s*extern\s+PyObject\*\s+(?P<symbol>PyInit_\w+)\s*\(\s*void\s*\)\s*;\s*$'
+)
+_STATICINIT_DISPATCH_RE = re.compile(
+    r'^\s*PyImport_AppendInittab\s*\(\s*"(?P<name>[^"]+)"\s*,\s*'
+    r'(?P<symbol>PyInit_\w+)\s*\)\s*;\s*$'
+)
+_ARM_GUARD = "#if defined(__arm64__) || defined(__aarch64__)"
+_X86_GUARD = "#if defined(__x86_64__) || defined(__amd64__)"
+
+
+def _find_staticinit(bundle_root: pathlib.Path) -> pathlib.Path | None:
+    include_dir = bundle_root / "include"
+    if not include_dir.is_dir():
+        return None
+    for child in sorted(include_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        candidate = child / "staticinit.h"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _parse_staticinit(path: pathlib.Path):
+    """Return (raw_lines, extern_entries, dispatch_entries).
+
+    extern_entries: list of (line_index, symbol)
+    dispatch_entries: list of (line_index, dotted_name, symbol)
+    """
+    lines = path.read_text().splitlines()
+    externs = []
+    dispatches = []
+    for idx, line in enumerate(lines):
+        m = _STATICINIT_EXTERN_RE.match(line)
+        if m:
+            externs.append((idx, m.group("symbol")))
+            continue
+        m = _STATICINIT_DISPATCH_RE.match(line)
+        if m:
+            dispatches.append(
+                (idx, m.group("name"), m.group("symbol"))
+            )
+    return lines, externs, dispatches
+
+
+def _build_staticinit_table(arm_disp, x86_disp):
+    """Build [(dotted_name, arm_symbol|None, x86_symbol|None)] preserving
+    arm-side dispatch order, then any x86-only entries appended."""
+    x86_map = {dotted: sym for _, dotted, sym in x86_disp}
+    table = []
+    seen = set()
+    for _, dotted, sym in arm_disp:
+        if dotted in seen:
+            continue
+        seen.add(dotted)
+        table.append((dotted, sym, x86_map.get(dotted)))
+    for _, dotted, sym in x86_disp:
+        if dotted in seen:
+            continue
+        seen.add(dotted)
+        table.append((dotted, None, sym))
+    return table
+
+
+def _render_staticinit_blocks(table):
+    extern_out = []
+    disp_out = []
+    for dotted, arm_sym, x86_sym in table:
+        if arm_sym and x86_sym and arm_sym == x86_sym:
+            extern_out.append(f"   extern PyObject* {arm_sym}(void);")
+            disp_out.append(
+                f'   PyImport_AppendInittab("{dotted}", {arm_sym});'
+            )
+            continue
+        if arm_sym:
+            extern_out.append(_ARM_GUARD)
+            extern_out.append(f"   extern PyObject* {arm_sym}(void);")
+            extern_out.append("#endif")
+            disp_out.append(_ARM_GUARD)
+            disp_out.append(
+                f'   PyImport_AppendInittab("{dotted}", {arm_sym});'
+            )
+            disp_out.append("#endif")
+        if x86_sym:
+            extern_out.append(_X86_GUARD)
+            extern_out.append(f"   extern PyObject* {x86_sym}(void);")
+            extern_out.append("#endif")
+            disp_out.append(_X86_GUARD)
+            disp_out.append(
+                f'   PyImport_AppendInittab("{dotted}", {x86_sym});'
+            )
+            disp_out.append("#endif")
+    return extern_out, disp_out
+
+
+def _merge_universal_staticinit(arm64: pathlib.Path,
+                                x86_64: pathlib.Path,
+                                out: pathlib.Path) -> None:
+    """Rewrite the universal bundle's staticinit.h with arch-guarded refs.
+
+    See lipo_bundles() for the why. No-op if either per-arch input is
+    missing the header (e.g. embeds built without static modules)."""
+    arm_h = _find_staticinit(arm64)
+    x86_h = _find_staticinit(x86_64)
+    out_h = _find_staticinit(out)
+    if arm_h is None or x86_h is None or out_h is None:
+        return
+
+    arm_lines, arm_externs, arm_disp = _parse_staticinit(arm_h)
+    _, _, x86_disp = _parse_staticinit(x86_h)
+    if not arm_externs or not arm_disp or not x86_disp:
+        return
+
+    table = _build_staticinit_table(arm_disp, x86_disp)
+    extern_block, dispatch_block = _render_staticinit_blocks(table)
+
+    first_extern = arm_externs[0][0]
+    last_extern = arm_externs[-1][0]
+    first_disp = arm_disp[0][0]
+    last_disp = arm_disp[-1][0]
+
+    merged = []
+    merged.extend(arm_lines[:first_extern])
+    merged.extend(extern_block)
+    merged.extend(arm_lines[last_extern + 1:first_disp])
+    merged.extend(dispatch_block)
+    merged.extend(arm_lines[last_disp + 1:])
+    out_h.write_text("\n".join(merged) + "\n")
+
+    arm_only = sum(1 for _, a, x in table if a and not x)
+    x86_only = sum(1 for _, a, x in table if x and not a)
+    shared_diff = sum(1 for _, a, x in table if a and x and a != x)
+    shared_same = sum(1 for _, a, x in table if a and x and a == x)
+    print(
+        f"  merged staticinit.h: {len(table)} modules "
+        f"(shared-same={shared_same}, shared-diffhash={shared_diff}, "
+        f"arm-only={arm_only}, x86-only={x86_only})"
+    )
 
 
 def _replace_cmake_bundle_libs(text: str, libs: list[str]) -> str:
